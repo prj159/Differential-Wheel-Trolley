@@ -74,6 +74,8 @@ float last_reliable_error = 0;
 
 float previous_error = 0;   // 记录上一次的偏差 (用于求微分)
 
+bool stopped = false;        // 全黑线停车标志
+
 // 【新增】用于在主循环中打印调试的全局变量
 int sensorState[8] = {0};   // 存储 8 个光电管的实时状态
 float current_error_out = 0;// 存储实时计算出的加权偏差值
@@ -219,8 +221,13 @@ void control(void)
     }
   }
 
-  // 道路交叉
+  // 道路交叉 / 全黑线停车
   if(LEDCounter == 8) {
+    stopped = true;           // 触发停车标志
+    target1 = 0;
+    target2 = 0;
+    t1 = 0;
+    t2 = 0;
     current_state = STRAIGHT;
     SHARPlastside = 0;
   }
@@ -359,21 +366,29 @@ void control(void)
 
   // 计算左电机 PID 输出并控制方向
   int output1 = pidController1(target1, velocity1);
-  if (output1 >= 0) {
-    digitalWrite(DIR1, HIGH);       
-    analogWrite(PWM1, output1);     
-  } else {
-    digitalWrite(DIR1, LOW);        
-    analogWrite(PWM1, -output1);    
-  }
-  
-  // 计算右电机 PID 输出并控制方向
   int output2 = pidController2(target2, velocity2);
+
+  if (stopped) {
+    output1 = 0;
+    output2 = 0;
+    u1 = 0;
+    u2 = 0;
+  }
+
+  if (output1 >= 0) {
+    digitalWrite(DIR1, HIGH);
+    analogWrite(PWM1, output1);
+  } else {
+    digitalWrite(DIR1, LOW);
+    analogWrite(PWM1, -output1);
+  }
+
+  // 计算右电机 PID 输出并控制方向
   if (output2 >= 0) {
-    digitalWrite(DIR2, LOW);       
+    digitalWrite(DIR2, LOW);
     analogWrite(PWM2, output2);
   } else {
-    digitalWrite(DIR2, HIGH);        
+    digitalWrite(DIR2, HIGH);
     analogWrite(PWM2, -output2);
   }
     
