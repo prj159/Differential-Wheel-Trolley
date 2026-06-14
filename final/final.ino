@@ -1,627 +1,728 @@
 /**
-  ******************************************************************************
-  * @file           : final.ino
-  * @brief          : 基于状态机的循迹小车控制程序（Arduino版）
-  ******************************************************************************
-  * mini_car_race
-  * v2.0.0
-  * 参考 STM32 版本 (main.c) 的状态判断与输出计算架构
-  * 传感器：8路数字光电管（L4 L3 L2 L1 R1 R2 R3 R4），低电平有效
-  * 控制周期：10ms（MsTimer2 定时中断）
-  ******************************************************************************
-  */
+ * Arduino 差速轮循迹小车
+ * 高级状态机实现 + 噪声滤波
+ * 控制周期: 10ms
+ */
 
 #include <MsTimer2.h>
 
-/* ======================== 引脚定义 ======================== */
-/* 编码器引脚 */
-#define ENCODER_A1 2
-#define ENCODER_B1 5
-#define ENCODER_A2 3
-#define ENCODER_B2 4
+// ==================== 引脚配置 ====================
+// 编码器引脚（用于测量车轮转速）
+#define ENCODER_A1 2    // 左轮编码器A相
+#define ENCODER_B1 5    // 左轮编码器B相
+#define ENCODER_A2 3    // 右轮编码器A相
+#define ENCODER_B2 4    // 右轮编码器B相
 
-/* 电机 PWM 引脚 (Mega2560 Timer1 对应 11, 12) */
-#define PWM1 11
-#define PWM2 12
+// 电机控制引脚
+#define PWM1 11         // 左电机PWM控制（速度）
+#define PWM2 12         // 右电机PWM控制（速度）
+#define DIR1 6          // 左电机方向控制
+#define DIR2 7          // 右电机方向控制
 
-/* 电机方向引脚 */
-#define DIR1 6
-#define DIR2 7
+// 8个光电传感器引脚（从左到右排列）
+#define L4_PIN A7       // 最左侧传感器
+#define L3_PIN A6       // 左3传感器
+#define L2_PIN A5       // 左2传感器
+#define L1_PIN A4       // 左1传感器
+#define R1_PIN A3       // 右1传感器
+#define R2_PIN A2       // 右2传感器
+#define R3_PIN A1       // 右3传感器
+#define R4_PIN A0       // 最右侧传感器
 
-/* 8 路循迹传感器引脚（低电平 = 检测到黑线，L4/R4 为最外侧） */
-#define L4_PIN A7   // 左4（最外侧）
-#define L3_PIN A6   // 左3
-#define L2_PIN A5   // 左2
-#define L1_PIN A4   // 左1（靠近中心）
-#define R1_PIN A3   // 右1（靠近中心）
-#define R2_PIN A2   // 右2
-#define R3_PIN A1   // 右3
-#define R4_PIN A0   // 右4（最外侧）
+// ==================== 控制参数配置 ====================
+#define CTRL_PERIOD 10  // 控制周期10ms (100Hz控制频率)
 
-/* ======================== 控制参数 ======================== */
-#define PERIOD 10               // 控制周期（ms）
+// 速度环PID增益参数（用于控制电机转速）
+#define P_GAIN 15.0     // 比例增益：响应误差大小
+#define I_TIME 70.0     // 积分时间：消除稳态误差
+#define D_TIME 15.0     // 微分时间：减少超调，提高稳定性
 
-/* ---------- 速度PID参数（左轮 / 右轮各自独立）---------- */
-/* 左轮PID参数 */
-#define L_Kp  7.0f              // 比例系数
-#define L_Ki  0.14f             // 积分系数（= Kp * T/Ti = 7 * 10/500）
-#define L_Kd  7.0f              // 微分系数（= Kp * Td/T = 7 * 10/10）
-#define L_INTEGRAL_MAX  80.0f   // 积分限幅（防积分饱和）
+// 转向PD控制器增益（用于左右轮差速转向）
+#define STEER_P 0.30    // 转向比例增益：控制转向灵敏度
+#define STEER_D 0.20    // 转向微分增益：抑制转向震荡
 
-/* 右轮PID参数 */
-#define R_Kp  7.0f              // 比例系数
-#define R_Ki  0.14f             // 积分系数（= Kp * T/Ti = 7 * 10/500）
-#define R_Kd  7.0f              // 微分系数（= Kp * Td/T = 7 * 10/10）
-#define R_INTEGRAL_MAX  80.0f   // 积分限幅（防积分饱和）
+// 速度限制参数
+#define BASE_VEL 3.0    // 基准速度（rad/s）
+#define VEL_LIMIT 5.0   // 最大速度限制（rad/s）
 
-/* ---------- 赛道状态与输出参数 ---------- */
-#define BASE_SPEED      6.0f    // [speed] 默认基础速度（m/s 量级）
-#define MAX_SPEED        10.0f  // [speed] 最大速度限幅
-#define STEERING_GAIN   0.8f    // 转向偏差→速度差映射增益
-#define SHARP_OUTPUT    2.4f    // [sharp] 急弯态的固定差速输出
-#define RIGHT_ANGLE_OUTPUT 3.0f // [right_angle] 直角弯的固定差速输出（更大）
-#define SHARP_SPEED     0.7f    // [sharp] 急弯降速系数
-#define RIGHT_ANGLE_SPEED 0.3f  // [right_angle] 直角弯降速系数（更慢）
-#define OUTLINE_MAX      3.0f   // [outline] 出界时保持的最大差速
-#define TIME_RECOVERING 8       // [recovering] 恢复态持续周期数（8×10ms=80ms）
-#define MAX_OUTLINE_TIME 30     // [stop] 连续出界超过此次数则停车
-#define SHARP_RATE       1.5f   // [rate] 重心变化率阈值，超过此值判定为急弯（传感器间距宽，靠速率补位）
+// ==================== 数据结构定义 ====================
 
-/* 传感器位置索引（用于重心计算） */
-/* 索引：L4=0, L3=1, L2=2, L1=3, R1=4, R2=5, R3=6, R4=7  中心=3.5 */
-#define SENSOR_CENTER 3.5f
-
-/* ==================== 数据结构 ==================== */
-
-/**
- * @brief 标准PID控制器结构体（用于轮速控制环）
- * @note  每个电机拥有独立的PID实例，互不干扰
- */
-struct PIDController {
-  float targetVal;      // 目标速度
-  float currentError;   // 当前误差
-  float preError;       // 上一次误差
-  float derivative;     // 微分项（误差变化率）
-  float integral;       // 积分项（误差累积）
-  float output;         // 控制器输出（PWM占空比）
-  float Kp, Ki, Kd;     // 比例、积分、微分系数
-  float integralMax;    // 积分限幅（每个电机独立）
+// 增量式PID控制器结构体（用于速度闭环控制）
+struct VelocityController {
+  float setpoint;      // 目标速度设定值
+  float err[3];        // 误差数组: err[0]=当前误差, err[1]=上次误差, err[2]=上上次误差
+  float control;       // PID输出的控制量（PWM值）
+  float coeff[3];      // PID系数: [0]=P项系数, [1]=I项系数, [2]=D项系数
 };
 
-/* 光电管传感器数据结构 */
-struct SensorInfo {
-  bool  MUX[8];         // 8路传感器布尔值（true=在线上）
-  int8_t LEDCounter;    // 总亮灯数（检测到线的传感器数）
-  int8_t LCounter;      // 左半侧亮灯数（索引0~3）
-  int8_t RCounter;      // 右半侧亮灯数（索引4~7）
-  int8_t Lmost;         // 最左侧亮灯索引（无则为8）
-  int8_t Rmost;         // 最右侧亮灯索引（无则为-1）
-  float centroid;       // 亮灯重心位置（加权平均，范围0~7）
+// 轨迹状态枚举（状态机的各种状态）
+enum TrackState {
+  STATE_STRAIGHT,      // 直线状态：传感器居中，小幅偏差
+  STATE_GENTLE,        // 缓弯状态：中等偏差，多传感器检测到
+  STATE_SHARP,         // 急弯状态：大幅偏差，边缘传感器触发
+  STATE_EDGE,          // 边缘状态：只有少数传感器检测到线
+  STATE_RECOVER,       // 恢复状态：从急弯或丢线后重新找到线
+  STATE_OUT_DEFAULT,   // 默认丢线状态：普通丢线，保持原方向搜索
+  STATE_OUT_SHARP      // 急弯丢线状态：从急弯丢线，需要继续转向
 };
 
-/* ==================== 赛道状态机定义 ==================== */
-typedef enum {
-  STRAIGHT,             // 直道
-  GENTLE_CURVE,         // 缓弯
-  SHARP_TURN,           // 急弯
-  RIGHT_ANGLE,          // 直角弯（≥4个传感器同时在线→线横穿车底）
-  EDGE,                 // 边缘（仅少量传感器在线上）
-  RECOVERING,           // 恢复态（急弯/出界后的消抖过渡）
-  OUTLINE               // 出界（所有传感器均不在线上）
-} STATE;
+// 传感器数据聚合结构体
+struct SensorData {
+  int reading[8];      // 8个传感器的原始读数（0=检测到黑线，1=白色地面）
+  int active_count;    // 检测到黑线的传感器总数
+  int left_count;      // 左侧（0-3）检测到线的传感器数
+  int right_count;     // 右侧（4-7）检测到线的传感器数
+  int leftmost_idx;    // 最左侧检测到线的传感器索引
+  int rightmost_idx;   // 最右侧检测到线的传感器索引
+  float weighted_pos;  // 加权位置（0-7，3.5为中心）
+};
 
-/* ==================== 全局变量 ==================== */
+// ==================== 全局状态变量 ====================
 
-/* 左右轮PID控制器（各自独立的 Kp/Ki/Kd/积分限幅，初始化在 setup() 中完成） */
-struct PIDController pidL;
-struct PIDController pidR;
+VelocityController leftCtrl, rightCtrl;  // 左右轮速度控制器
 
-/* 编码器脉冲累计（由中断服务函数更新，控制函数读取后清零） */
-volatile long encoderVal1 = 0;
-volatile long encoderVal2 = 0;
+volatile long leftPulse = 0;   // 左轮编码器脉冲计数（中断中更新）
+volatile long rightPulse = 0;  // 右轮编码器脉冲计数（中断中更新）
 
-/* 速度测量值（由编码器脉冲换算） */
-float velocity1 = 0;
-float velocity2 = 0;
+float leftSpeed = 0;   // 左轮实际速度（经过滤波）
+float rightSpeed = 0;  // 右轮实际速度（经过滤波）
 
-/* 上一次控制周期的目标速度（用于平滑过渡） */
-float prevTarget1 = 0;
-float prevTarget2 = 0;
+float prevLeftSetpoint = 0;   // 上一次左轮目标速度（用于低通滤波）
+float prevRightSetpoint = 0;  // 上一次右轮目标速度（用于低通滤波）
 
-/* 赛道状态相关 */
-STATE current_state = STRAIGHT;       // 当前状态
-STATE last_state    = STRAIGHT;       // 上一周期状态
-float speed_factor  = 1.0f;           // 速度系数（急弯时降速）
-float last_reliable_error = 0;        // 上一次有效偏差（出界时保持）
-int8_t sharp_last_side = 0;           // 急弯方向记忆（-1=左弯, +1=右弯, 0=未知）
-uint8_t recCounter = 0;               // 恢复态计数器
-uint8_t outlineCounter = 0;           // 出界累计计数器
-bool STOPFlag = false;                // 紧急停车标志
+TrackState currentMode = STATE_STRAIGHT;   // 当前轨迹状态
+TrackState previousMode = STATE_STRAIGHT;  // 上一次轨迹状态
 
-/* 上一周期重心值（用于计算重心变化率，辅助弯道急缓判断） */
-float prev_centroid = SENSOR_CENTER;
+float lastValidError = 0;   // 最后一次有效的偏差值（用于丢线时的方向判断）
+float prevSteerError = 0;   // 上一次转向误差（用于微分计算）
+int sharpDirection = 0;     // 急弯方向累积值（正=左转，负=右转）
+int lostCounter = 0;        // 丢线计数器（连续丢线帧数）
+int recoverTimer = 0;       // 恢复状态计时器
 
-/* 平滑后的目标速度 */
-float t1 = 0, t2 = 0;
+bool emergencyStop = false; // 紧急停止标志（检测到终点线时触发）
 
-/* ==================== 函数声明 ==================== */
-void readSensors(struct SensorInfo *s);
-void judgeState(struct SensorInfo *s);
-float computeOutput(struct SensorInfo *s);
-void computePID(struct PIDController *pid, float measuredVal);
-int  applyMotorOutput(struct PIDController *pid, int dirPin, int pwmPin, int *lastPwm);
+// 传感器状态缓冲区（用于主循环调试输出）
+int sensorBuffer[8] = {0};
+float errorBuffer = 0;
 
-/* ==================== 传感器读取 ==================== */
+// 历史误差跟踪（用于丢线后恢复方向判断）
+float errorHistory[20] = {0};  // 存储最近20次的偏差值
+int historyIndex = 0;           // 历史数组的当前索引
+int historySize = 0;            // 历史数组的有效数据量
+
+// 上一次有效的线段位置（用于噪声滤波）
+int prevSegment[8] = {0};
+
+// ==================== 函数声明 ====================
+void updateControl();  // 主控制更新函数（10ms周期调用）
+void acquireSensorData(SensorData* data);  // 采集传感器数据
+void filterNoiseSegments(SensorData* data);  // 滤除噪声线段
+void determineTrackState(SensorData* data);  // 判断轨迹状态
+float calculateSteeringOutput(SensorData* data);  // 计算转向输出
+void updateVelocityPID(VelocityController* ctrl, float measured);  // 更新速度PID
+void driveMotor(VelocityController* ctrl, int dirPin, int pwmPin);  // 驱动电机
+void leftEncoderISR();   // 左轮编码器中断服务函数
+void rightEncoderISR();  // 右轮编码器中断服务函数
+
+// ==================== 传感器采集与滤波 ====================
+
 /**
- * @brief  读取8路光电管并更新传感器数据结构
- * @param  s 传感器数据结构体指针
- * @note   传感器低电平有效（LOW = 检测到黑线）
- *         计算亮灯分布、重心、左右统计，供状态判断使用
+ * 采集8个光电传感器的数据
+ * @param data 传感器数据结构指针
+ * 说明：传感器检测到黑线时输出LOW，白色地面时输出HIGH
+ *       这里将LOW转换为1，HIGH转换为0，方便后续处理
  */
-void readSensors(struct SensorInfo *s) {
-  /* 读取8路传感器（LOW = 在线上，从左到右：L4 L3 L2 L1 R1 R2 R3 R4） */
-  s->MUX[0] = (digitalRead(L4_PIN) == LOW);
-  s->MUX[1] = (digitalRead(L3_PIN) == LOW);
-  s->MUX[2] = (digitalRead(L2_PIN) == LOW);
-  s->MUX[3] = (digitalRead(L1_PIN) == LOW);
-  s->MUX[4] = (digitalRead(R1_PIN) == LOW);
-  s->MUX[5] = (digitalRead(R2_PIN) == LOW);
-  s->MUX[6] = (digitalRead(R3_PIN) == LOW);
-  s->MUX[7] = (digitalRead(R4_PIN) == LOW);
+void acquireSensorData(SensorData* data) {
+  // 读取原始传感器值（LOW = 检测到黑线）
+  data->reading[0] = (digitalRead(L4_PIN) == LOW) ? 1 : 0;  // 最左
+  data->reading[1] = (digitalRead(L3_PIN) == LOW) ? 1 : 0;
+  data->reading[2] = (digitalRead(L2_PIN) == LOW) ? 1 : 0;
+  data->reading[3] = (digitalRead(L1_PIN) == LOW) ? 1 : 0;
+  data->reading[4] = (digitalRead(R1_PIN) == LOW) ? 1 : 0;
+  data->reading[5] = (digitalRead(R2_PIN) == LOW) ? 1 : 0;
+  data->reading[6] = (digitalRead(R3_PIN) == LOW) ? 1 : 0;
+  data->reading[7] = (digitalRead(R4_PIN) == LOW) ? 1 : 0;  // 最右
 
-  /* 统计初始化 */
-  s->centroid    = 0;
-  s->LEDCounter  = 0;
-  s->LCounter    = 0;
-  s->RCounter    = 0;
-  s->Lmost       = 8;
-  s->Rmost       = -1;
-
-  /* 遍历8路传感器，计算统计数据 */
+  // 复制到缓冲区用于调试输出
   for (int i = 0; i < 8; i++) {
-    if (s->MUX[i]) {
-      /* 左右侧计数：索引0~3为左侧，4~7为右侧 */
-      if (i < 4)       s->LCounter++;
-      else             s->RCounter++;
-
-      /* 最左/最右亮灯索引 */
-      if (i < s->Lmost) s->Lmost = i;
-      if (i > s->Rmost) s->Rmost = i;
-
-      /* 重心累加 */
-      s->centroid += i;
-      s->LEDCounter++;
-    }
-  }
-
-  /* 计算重心平均值（有效亮灯数>0时） */
-  if (s->LEDCounter > 0) {
-    s->centroid /= s->LEDCounter;
+    sensorBuffer[i] = data->reading[i];
   }
 }
 
-/* ==================== 状态判断模块 ==================== */
 /**
- * @brief  根据传感器数据判断当前赛道状态
- * @param  s 传感器数据结构体指针
- * @note   状态优先级：出界 > 终点(8灯) > 直角弯(≥4灯) > 急弯 > 缓弯 > 直道
- *         急弯判断：传感器位置(外侧灯亮) + 重心变化率(>SHARP_RATE) 双重判定
- *         直道判断：仅中间两个灯(L1/R1)亮即可，输出由重心自动偏左/偏右
- *         状态切换时触发 RECOVERING 消抖过渡
+ * 噪声线段滤波函数
+ * @param data 传感器数据结构指针
+ * 功能：当检测到多个不连续的线段时，只保留与上一次位置重叠最多的线段
+ * 目的：防止相邻赛道或地面污渍被误识别为黑线
  */
-void judgeState(struct SensorInfo *s) {
+void filterNoiseSegments(SensorData* data) {
+  // 反转数据用于处理（1=检测到线，0=未检测到）
+  int activeLine[8];
+  for (int i = 0; i < 8; i++) {
+    activeLine[i] = (data->reading[i] == 0) ? 1 : 0;
+  }
 
-  /* ---- 1. 出界判断（所有传感器均不在线上）---- */
-  if (s->LEDCounter == 0) {
-    outlineCounter++;
-    if (outlineCounter > MAX_OUTLINE_TIME) {
-      STOPFlag = true;    // 长时间出界→紧急停车
+  // 线段检测：找出所有连续的线段
+  int segments[4][2];  // 最多4个线段，每个记录[起始位置, 结束位置]
+  int segmentCount = 0;
+  int inSegment = 0;
+
+  for (int i = 0; i <= 8; i++) {
+    if (i < 8 && activeLine[i] == 1) {
+      if (!inSegment) {
+        segments[segmentCount][0] = i;  // 线段起始
+        inSegment = 1;
+      }
+    } else {
+      if (inSegment) {
+        segments[segmentCount][1] = i - 1;  // 线段结束
+        segmentCount++;
+        inSegment = 0;
+      }
     }
-    /* 保持上一状态不变（由 computeOutput 使用 last_reliable_error） */
+  }
+
+  // 多线段噪声滤波：只保留与历史位置重叠最多的线段
+  if (segmentCount > 1) {
+    int maxOverlap = -1;  // 最大重叠数
+    int bestIdx = 0;      // 最佳线段索引
+
+    // 遍历每个线段，计算与上次位置的重叠度
+    for (int s = 0; s < segmentCount; s++) {
+      int overlap = 0;
+      for (int i = segments[s][0]; i <= segments[s][1]; i++) {
+        if (prevSegment[i] == 1) overlap++;  // 计算重叠传感器数
+      }
+
+      int segWidth = segments[s][1] - segments[s][0];
+      int bestWidth = segments[bestIdx][1] - segments[bestIdx][0];
+
+      // 选择重叠最多的线段；若重叠相同，选择更宽的线段
+      if (overlap > maxOverlap || (overlap == maxOverlap && segWidth > bestWidth)) {
+        maxOverlap = overlap;
+        bestIdx = s;
+      }
+    }
+
+    // 丢弃非最佳线段
+    for (int i = 0; i < 8; i++) {
+      if (i >= segments[bestIdx][0] && i <= segments[bestIdx][1]) {
+        // 保留最佳线段
+      } else {
+        activeLine[i] = 0;
+        data->reading[i] = 1;  // 标记为未检测到线
+      }
+    }
+  }
+
+  // 更新历史线段位置记忆
+  for (int i = 0; i < 8; i++) {
+    prevSegment[i] = activeLine[i];
+  }
+}
+
+/**
+ * 计算传感器统计数据
+ * @param data 传感器数据结构指针
+ * 功能：计算激活传感器数量、左右分布、边界位置、加权中心位置
+ */
+void computeSensorStatistics(SensorData* data) {
+  data->active_count = 0;    // 检测到线的传感器总数
+  data->left_count = 0;      // 左侧检测到线的数量
+  data->right_count = 0;     // 右侧检测到线的数量
+  data->leftmost_idx = 8;    // 最左边界（初始化为无效值）
+  data->rightmost_idx = -1;  // 最右边界（初始化为无效值）
+  data->weighted_pos = 0;    // 加权位置
+
+  // 遍历所有传感器，统计信息
+  for (int i = 0; i < 8; i++) {
+    if (data->reading[i] == 0) {  // 检测到黑线
+      if (i < 4) data->left_count++;   // 左半部分
+      else data->right_count++;        // 右半部分
+
+      if (i < data->leftmost_idx) data->leftmost_idx = i;
+      if (i > data->rightmost_idx) data->rightmost_idx = i;
+
+      data->weighted_pos += i;  // 累加位置用于加权平均
+      data->active_count++;
+    }
+  }
+
+  // 计算加权平均位置（黑线的中心位置）
+  static float lastValidPos = 3.5;  // 默认中心位置
+  if (data->active_count > 0) {
+    data->weighted_pos /= data->active_count;  // 加权平均
+    lastValidPos = data->weighted_pos;
+  } else {
+    // 没有检测到线时，使用上次有效位置
+    data->weighted_pos = lastValidPos;
+  }
+}
+
+// ==================== 状态机逻辑 ====================
+
+/**
+ * 判断当前轨迹状态
+ * @param data 传感器数据结构指针
+ * 功能：根据传感器数据判断小车当前处于什么状态（直线、缓弯、急弯、丢线等）
+ *       这是整个控制系统的核心决策部分
+ */
+void determineTrackState(SensorData* data) {
+  // ===== 丢线检测 =====
+  if (data->active_count == 0) {
+    lostCounter++;  // 丢线计数器递增
+    if (lostCounter >= 8) {  // 连续8个周期（80ms）都丢线
+      // 根据之前的状态决定丢线后的策略
+      if (currentMode != STATE_OUT_SHARP && currentMode != STATE_OUT_DEFAULT) {
+        if (previousMode == STATE_SHARP || previousMode == STATE_RECOVER) {
+          // 从急弯丢线：继续按急弯方向转
+          currentMode = STATE_OUT_SHARP;
+        } else {
+          // 普通丢线：按历史偏差方向搜索
+          currentMode = STATE_OUT_DEFAULT;
+        }
+      }
+    } else {
+      // 丢线时间不足，保持之前状态
+      currentMode = previousMode;
+    }
     return;
   } else {
-    outlineCounter = 0;   // 检测到线，清零出界计数器
+    lostCounter = 0;  // 检测到线，清零丢线计数
   }
 
-  /* ---- 2. 赛道状态判定（有传感器在线）---- */
-  if (s->LEDCounter == 8) {
-    /* 全部传感器均在线 → 到达终点，停车 */
-    STOPFlag = true;
+  // ===== 恢复侧滤波（防止误检测相邻赛道）=====
+  // 如果正在丢线状态，突然检测到相反方向的线，可能是相邻赛道
+  if (data->active_count > 0 && (currentMode == STATE_OUT_SHARP || currentMode == STATE_OUT_DEFAULT)) {
+    if (lastValidError > 1.0 && data->weighted_pos > 3.5) {
+      // 上次向左偏，但现在检测到右侧线 -> 可能是相邻赛道，忽略
+      data->active_count = 0;
+      for (int i = 0; i < 8; i++) prevSegment[i] = 0;
+      return;
+    } else if (lastValidError < -1.0 && data->weighted_pos < 3.5) {
+      // 上次向右偏，但现在检测到左侧线 -> 可能是相邻赛道，忽略
+      data->active_count = 0;
+      for (int i = 0; i < 8; i++) prevSegment[i] = 0;
+      return;
+    }
+  }
+
+  // ===== 终点线检测 =====
+  // 所有传感器都检测到线 = 宽黑色终点线
+  if (data->active_count == 8) {
+    emergencyStop = true;  // 触发紧急停止
+    leftCtrl.setpoint = 0;
+    rightCtrl.setpoint = 0;
+    prevLeftSetpoint = 0;
+    prevRightSetpoint = 0;
+    currentMode = STATE_STRAIGHT;
+    sharpDirection = 0;
     return;
   }
-  else if (s->LEDCounter >= 4) {
-    /* 直角弯：≥4个传感器同时在线 → 黑线横穿车底，即将急转 */
-    current_state = RIGHT_ANGLE;
-    if (last_state != RIGHT_ANGLE) sharp_last_side = 0;
-    /* 累计方向记忆（哪侧传感器更多就往哪边拐） */
-    sharp_last_side += (s->LCounter > s->RCounter) ? -1 : 1;
+
+  // ===== 状态判断逻辑 =====
+  // 直线状态：左右传感器数量接近，总数少，不在边缘
+  if (abs(data->left_count - data->right_count) <= 2 &&
+      data->active_count <= 3 &&
+      data->leftmost_idx != 0 &&
+      data->rightmost_idx != 7) {
+    currentMode = STATE_STRAIGHT;
+  }
+  // 急弯状态：大量传感器在一侧，且触及边缘传感器
+  else if (((data->left_count >= 3 && data->leftmost_idx == 0 && data->rightmost_idx != 7) ||
+            (data->right_count >= 3 && data->rightmost_idx == 7 && data->leftmost_idx != 0)) &&
+           data->active_count >= 4) {
+    currentMode = STATE_SHARP;
+    // 累积急弯方向（用于判断左转还是右转）
+    if (previousMode != STATE_SHARP) sharpDirection = 0;
+    sharpDirection += data->left_count > data->right_count ? 1 : -1;
+  }
+  // 缓弯状态：较多传感器检测到线
+  else if (data->active_count >= 3) {
+    currentMode = STATE_GENTLE;
+  }
+  // 边缘状态：少量传感器检测到线
+  else if (data->active_count >= 1) {
+    currentMode = STATE_EDGE;
   }
   else {
-    /* ---- 基于重心变化率 + 传感器位置的双重判断 ---- */
-    float d_centroid = s->centroid - prev_centroid;  // 本周期重心偏移速率
+    currentMode = STATE_STRAIGHT;
+  }
 
-    if (s->Lmost >= 3 && s->Rmost <= 4) {
-      /* 直道：只有中间两个灯(L1=3 或 R1=4)亮
-       * 中间偏左(L1)亮 → centroid=3 → steerting偏左
-       * 中间偏右(R1)亮 → centroid=4 → steering偏右 */
-      current_state = STRAIGHT;
-      sharp_last_side = 0;
+  // ===== 恢复状态转换 =====
+  // 从急弯或丢线状态恢复到正常状态时，需要平滑过渡
+  if ((previousMode == STATE_SHARP && currentMode != STATE_SHARP &&
+       currentMode != STATE_OUT_SHARP && currentMode != STATE_OUT_DEFAULT) ||
+      (previousMode == STATE_OUT_SHARP && currentMode != STATE_OUT_SHARP &&
+       currentMode != STATE_OUT_DEFAULT)) {
+    currentMode = STATE_RECOVER;
+    recoverTimer = 0;
+  }
+
+  // ===== 恢复状态计时 =====
+  if (previousMode == STATE_RECOVER) {
+    recoverTimer++;
+    if (currentMode != STATE_SHARP && currentMode != STATE_OUT_DEFAULT &&
+        currentMode != STATE_OUT_SHARP) {
+      currentMode = STATE_RECOVER;
     }
-    else if ((s->Lmost == 0 && s->Rmost < 7) ||
-             (s->Rmost == 7 && s->Lmost > 0) ||
-             fabs(d_centroid) > SHARP_RATE) {
-      /* 急弯：最外侧传感器(L4/R4)亮起，或重心变化速率超过阈值
-       * 单传感器也可触发（传感器间距宽）
-       * 速率超阈值说明黑线正在快速偏移，即使未到最外侧也预判为急弯 */
-      current_state = SHARP_TURN;
-      if (last_state != SHARP_TURN) sharp_last_side = 0;
-      /* 累计方向记忆（消抖：防止出界前瞬间的不可靠读数） */
-      sharp_last_side += (s->LCounter > s->RCounter) ? -1 : 1;
-    }
-    else if (s->LEDCounter >= 1) {
-      /* 缓弯：≥1个传感器在线，重心变化率不高 */
-      current_state = GENTLE_CURVE;
-      sharp_last_side = 0;
-    }
-    else {
-      current_state = STRAIGHT;
-      sharp_last_side = 0;
+    if (recoverTimer >= 8) {  // 恢复8个周期（80ms）后回到正常
+      currentMode = STATE_STRAIGHT;
+      sharpDirection = 0;
     }
   }
 
-  /* 更新上一周期重心值 */
-  prev_centroid = s->centroid;
+  previousMode = currentMode;  // 更新历史状态
 
-  /* ---- 3. 状态恢复检测：从急弯/直角弯/出界转出→进入 RECOVERING 消抖 ---- */
-  if ((last_state == SHARP_TURN  && current_state != SHARP_TURN)  ||
-      (last_state == RIGHT_ANGLE && current_state != RIGHT_ANGLE) ||
-      (last_state == OUTLINE     && current_state != OUTLINE)) {
-    current_state = RECOVERING;
-    recCounter = 0;
+  // 清除急弯方向累积（非急弯相关状态）
+  if (currentMode != STATE_SHARP && currentMode != STATE_OUT_SHARP &&
+      currentMode != STATE_RECOVER) {
+    sharpDirection = 0;
   }
-
-  /* RECOVERING 状态计时维持 */
-  if (last_state == RECOVERING) {
-    recCounter++;
-    if (current_state != SHARP_TURN && current_state != RIGHT_ANGLE && current_state != OUTLINE) {
-      current_state = RECOVERING;   // 维持恢复态（除非再次进入急弯/直角弯/出界）
-    }
-    if (recCounter >= TIME_RECOVERING) {
-      current_state = STRAIGHT;     // 计时满→回到直道
-      sharp_last_side = 0;
-    }
-  }
-
-  /* 非急弯/直角弯/出界/恢复态时，清零方向记忆 */
-  if (current_state != SHARP_TURN  && current_state != RIGHT_ANGLE &&
-      current_state != OUTLINE     && current_state != RECOVERING) {
-    sharp_last_side = 0;
-  }
-
-  last_state = current_state;
 }
 
-/* ==================== 输出计算模块 ==================== */
+// ==================== 转向输出计算 ====================
+
 /**
- * @brief  根据赛道状态计算转向差速输出
- * @param  s 传感器数据结构体指针
- * @return 转向差速值（正值=右转，负值=左转），叠加到基础速度上
- * @note   不同状态使用不同的偏差增益和速度系数
- *         参考 main.c 中的 computeMUXVal() 输出计算逻辑
+ * 计算转向输出并设置左右轮目标速度
+ * @param data 传感器数据结构指针
+ * @return 转向误差值
+ * 功能：根据当前状态和传感器位置，计算左右轮的目标速度
+ *       核心思想：差速转向（左右轮速度差产生转向）
  */
-float computeOutput(struct SensorInfo *s) {
-  float result = 0;
-  /* 基础偏差：重心偏离中心的程度（范围约 -2.8 ~ +2.8） */
-  float base_error = (s->centroid - SENSOR_CENTER) * STEERING_GAIN;
+float calculateSteeringOutput(SensorData* data) {
+  float output = 0;        // 转向输出值
+  float speedRatio = 1.0;  // 速度比例（不同状态下速度不同）
+  float baseError = (3.5 - data->weighted_pos);  // 基础偏差（3.5是中心，负值=偏右，正值=偏左）
 
-  switch (current_state) {
+  // ===== 更新误差历史 =====
+  // 记录最近20次的偏差，用于丢线时判断搜索方向
+  if (data->active_count > 0) {
+    errorHistory[historyIndex] = baseError;
+    historyIndex = (historyIndex + 1) % 20;  // 循环队列
+    if (historySize < 20) historySize++;
+  }
 
-    case STRAIGHT:
-      /* 直道：正常比例响应 */
-      result       = base_error * 1.3f;
-      speed_factor = 1.0f;
+  // ===== 根据状态计算转向输出和速度比例 =====
+  switch (currentMode) {
+    case STATE_STRAIGHT:  // 直线状态
+      output = baseError * 1.3;  // 较小的转向增益
+      speedRatio = 1.0;          // 全速前进
       break;
 
-    case GENTLE_CURVE:
-      /* 缓弯：适度增强响应 */
-      result       = base_error * 1.6f;
-      speed_factor = 1.0f;
+    case STATE_GENTLE:  // 缓弯状态
+      output = baseError * 1.8;  // 中等转向增益
+      speedRatio = 0.8;          // 略微降速
       break;
 
-    case SHARP_TURN:
-      /* 急弯：固定满舵输出，方向由 sharp_last_side 决定 */
-      result       = (sharp_last_side < 0) ? -SHARP_OUTPUT : SHARP_OUTPUT;
-      result       = (sharp_last_side == 0) ? 0 : result;
-      speed_factor = SHARP_SPEED;
+    case STATE_SHARP:  // 急弯状态
+      // 根据累积的转向方向决定转向输出
+      if (sharpDirection > 0) output = 8.0;   // 左转
+      else if (sharpDirection < 0) output = -8.0;  // 右转
+      else output = 0;
+      speedRatio = 0.2;  // 大幅降速以完成急弯
       break;
 
-    case RIGHT_ANGLE:
-      /* 直角弯：最大差速输出（接近原地旋转），方向由 sharp_last_side 决定 */
-      result       = (sharp_last_side < 0) ? -RIGHT_ANGLE_OUTPUT : RIGHT_ANGLE_OUTPUT;
-      result       = (sharp_last_side == 0) ? 0 : result;
-      speed_factor = RIGHT_ANGLE_SPEED;
+    case STATE_OUT_SHARP:    // 急弯丢线状态
+    case STATE_OUT_DEFAULT:  // 默认丢线状态
+      {
+        // 计算历史偏差的平均值，判断应该往哪个方向搜索
+        float avgError = 0;
+        if (historySize > 0) {
+          for (int i = 0; i < historySize; i++) {
+            avgError += errorHistory[i];
+          }
+          avgError /= historySize;
+        }
+
+        // 根据历史平均偏差决定搜索方向
+        if (avgError > 0) output = 8.0;       // 历史偏左，继续左转搜索
+        else if (avgError < 0) output = -8.0;  // 历史偏右，继续右转搜索
+        else output = 8.0;                     // 无历史数据，默认左转
+
+        speedRatio = 0.2;  // 低速搜索
+      }
       break;
 
-    case OUTLINE:
-      /* 出界：保持上一次有效偏差，并限幅 */
-      result       = last_reliable_error;
-      if (result >  OUTLINE_MAX) result =  OUTLINE_MAX;
-      if (result < -OUTLINE_MAX) result = -OUTLINE_MAX;
-      speed_factor = 1.0f;
+    case STATE_EDGE:  // 边缘状态
+      output = baseError * 2.3;  // 较大的转向增益
+      speedRatio = 0.8;          // 略微降速
       break;
 
-    case EDGE:
-      /* 边缘：强化响应，尽快拉回线中心 */
-      result       = base_error * 2.0f;
-      speed_factor = 1.0f;
-      break;
-
-    case RECOVERING:
-      /* 恢复态：抑制过冲，缓慢回调 */
-      result       = base_error * 0.6f;
-      speed_factor = 1.0f;
-      break;
-
-    default:
-      result       = base_error;
-      speed_factor = 1.0f;
+    case STATE_RECOVER:  // 恢复状态
+      output = baseError * 0.8;  // 较小的转向增益，平滑过渡
+      speedRatio = 0.8;          // 略微降速
       break;
   }
 
-  /* 保存有效误差（供出界时保持） */
-  if (s->LEDCounter > 0) {
-    last_reliable_error = result;
+  // 速度比例限制
+  if (speedRatio > 1.0) speedRatio = 1.0;
+  if (data->active_count == 0) speedRatio = 0.2;  // 丢线时低速
+
+  // 记录有效的转向误差（用于丢线恢复判断）
+  if (data->active_count > 0) {
+    lastValidError = output;
   }
 
-  return result;
+  errorBuffer = output;  // 保存到缓冲区用于调试
+
+  // ===== 转向PD控制 =====
+  // 使用PD控制器平滑转向输出，防止震荡
+  float rawDerivative = output - prevSteerError;  // 计算原始微分项
+  static float filteredDerivative = 0;
+  filteredDerivative = filteredDerivative * 0.6 + rawDerivative * 0.4;  // 微分项低通滤波
+
+  float steeringAdjust = (STEER_P * output) + (STEER_D * filteredDerivative);  // PD控制输出
+  prevSteerError = output;
+
+  // ===== 计算左右轮目标速度 =====
+  // 差速转向：左轮减速、右轮加速 -> 左转；反之 -> 右转
+  float dynamicSpeed = BASE_VEL * speedRatio;
+  leftCtrl.setpoint = dynamicSpeed - steeringAdjust;   // 左轮速度
+  rightCtrl.setpoint = dynamicSpeed + steeringAdjust;  // 右轮速度
+
+  // ===== 速度限制（保持差速比例）=====
+  // 如果某个轮子超速，两个轮子同时减速，保持差速比例不变
+  if (leftCtrl.setpoint > VEL_LIMIT) {
+    float excess = leftCtrl.setpoint - VEL_LIMIT;
+    leftCtrl.setpoint -= excess;
+    rightCtrl.setpoint -= excess;
+  } else if (rightCtrl.setpoint > VEL_LIMIT) {
+    float excess = rightCtrl.setpoint - VEL_LIMIT;
+    leftCtrl.setpoint -= excess;
+    rightCtrl.setpoint -= excess;
+  }
+
+  return output;
 }
 
-/* ==================== PID 控制器计算 ==================== */
+// ==================== 速度PID控制器 ====================
+
 /**
- * @brief  位置式PID控制器（用于轮速环）
- * @param  pid        PID控制器结构体指针
- * @param  measuredVal 当前测量速度
- * @note   每个电机调用各自独立的PID实例
- *         包含积分限幅防饱和、输出硬限幅
+ * 更新速度PID控制器
+ * @param ctrl 速度控制器结构指针
+ * @param measured 测量的实际速度
+ * 功能：使用增量式PID算法，根据速度误差计算控制量（PWM值）
+ *       增量式PID的优点：只输出增量，避免积分饱和问题
  */
-void computePID(struct PIDController *pid, float measuredVal) {
-  /* 误差更新 */
-  pid->preError     = pid->currentError;
-  pid->currentError = pid->targetVal - measuredVal;
+void updateVelocityPID(VelocityController* ctrl, float measured) {
+  // 更新误差历史（保存最近3次误差）
+  ctrl->err[2] = ctrl->err[1];  // 上上次误差
+  ctrl->err[1] = ctrl->err[0];  // 上次误差
+  ctrl->err[0] = ctrl->setpoint - measured;  // 当前误差 = 目标值 - 实际值
 
-  /* 微分更新（误差变化率） */
-  pid->derivative   = pid->currentError - pid->preError;
+  // 增量式PID公式：Δu = Kp*[e(k) - e(k-1)] + Ki*e(k) + Kd*[e(k) - 2e(k-1) + e(k-2)]
+  // 等效于：Δu = coeff[0]*err[0] + coeff[1]*err[1] + coeff[2]*err[2]
+  ctrl->control += ctrl->coeff[0] * ctrl->err[0] +
+                   ctrl->coeff[1] * ctrl->err[1] +
+                   ctrl->coeff[2] * ctrl->err[2];
 
-  /* 积分更新（误差累积） */
-  pid->integral    += pid->currentError;
-
-  /* 积分限幅（防止积分饱和，每个电机独立限幅值） */
-  if (pid->integral >  pid->integralMax) pid->integral =  pid->integralMax;
-  if (pid->integral < -pid->integralMax) pid->integral = -pid->integralMax;
-
-  /* PID输出 = 比例项 + 积分项 + 微分项 */
-  pid->output = pid->Kp * pid->currentError
-              + pid->Ki * pid->integral
-              + pid->Kd * pid->derivative;
-
-  /* 输出限幅（适配 analogWrite 的 0~255 范围） */
-  if (pid->output >  255.0f) pid->output =  255.0f;
-  if (pid->output < -255.0f) pid->output = -255.0f;
+  // 控制量限幅（PWM范围：-255 ~ 255）
+  if (ctrl->control > 255) ctrl->control = 255;
+  if (ctrl->control < -255) ctrl->control = -255;
 }
 
-/* ==================== 电机输出应用 ==================== */
 /**
- * @brief  将PID输出值应用到指定电机
- * @param  pid      PID控制器结构体指针
- * @param  dirPin   方向控制引脚
- * @param  pwmPin   PWM输出引脚
- * @param  lastPwm  上一次PWM值指针（用于变化率限幅）
- * @return 实际写入的PWM值
- * @note   正值=正转，负值=反转
- *         变化率限幅防止电流冲击（每次最多变化50）
+ * 驱动电机
+ * @param ctrl 速度控制器结构指针
+ * @param dirPin 方向控制引脚
+ * @param pwmPin PWM控制引脚
+ * 功能：根据PID控制量输出PWM信号驱动电机
  */
-int applyMotorOutput(struct PIDController *pid, int dirPin, int pwmPin, int *lastPwm) {
-  int pwm = (int)pid->output;
+void driveMotor(VelocityController* ctrl, int dirPin, int pwmPin) {
+  int pwmValue = (int)ctrl->control;
 
-  /* 紧急停车：强制输出0 */
-  if (STOPFlag) pwm = 0;
+  // 紧急停止检查
+  if (emergencyStop) {
+    pwmValue = 0;
+    ctrl->control = 0;
+  }
 
-  /* 变化率限幅（每次最多变化50，防止电流冲击） */
-  if (pwm - *lastPwm >  50) pwm = *lastPwm + 50;
-  if (pwm - *lastPwm < -50) pwm = *lastPwm - 50;
-  *lastPwm = pwm;
-
-  /* 方向与PWM输出 */
-  if (pwm >= 0) {
-    digitalWrite(dirPin, HIGH);   // 正转方向
-    analogWrite(pwmPin, pwm);
+  // 设置电机方向和速度
+  if (pwmValue >= 0) {
+    digitalWrite(dirPin, HIGH);      // 正向旋转
+    analogWrite(pwmPin, pwmValue);   // 输出PWM
   } else {
-    digitalWrite(dirPin, LOW);    // 反转方向
-    analogWrite(pwmPin, -pwm);
+    digitalWrite(dirPin, LOW);       // 反向旋转
+    analogWrite(pwmPin, -pwmValue);  // 输出PWM（取绝对值）
   }
-
-  return pwm;
 }
 
-/* ==================== 定时控制函数（每 PERIOD ms 执行一次） ==================== */
+// ==================== 主控制循环 (10ms定时中断) ====================
+
 /**
- * @brief  MsTimer2 定时中断回调（10ms周期）
- * @note   主控制回环：
- *          1. 读取8路传感器 → 填充 SensorInfo
- *          2. 状态判断 → judgeState()
- *          3. 输出计算 → computeOutput() 得到转向差速
- *          4. 差速模型分配左右轮目标速度
- *          5. 编码器→速度换算
- *          6. 左右轮PID计算 → computePID()
- *          7. PWM+方向输出 → applyMotorOutput()
+ * 主控制更新函数（每10ms被定时器中断调用一次）
+ * 功能：完整的控制流程
+ *   1. 采集传感器数据
+ *   2. 滤除噪声
+ *   3. 计算统计信息
+ *   4. 判断状态
+ *   5. 计算转向输出
+ *   6. 测量实际速度
+ *   7. 更新PID控制器
+ *   8. 输出PWM信号
  */
-void control(void) {
-  struct SensorInfo sensor;
-  float steering;           // 转向差速值
-  float targetL, targetR;   // 左右轮目标速度
+void updateControl() {
+  SensorData sensor;
 
-  /* ---- 1. 读取传感器 ---- */
-  readSensors(&sensor);
+  // ===== 步骤1-3: 传感器数据处理 =====
+  acquireSensorData(&sensor);      // 读取8个传感器
+  filterNoiseSegments(&sensor);    // 滤除多余线段
+  computeSensorStatistics(&sensor); // 计算位置和统计信息
 
-  /* ---- 2. 状态判断 ---- */
-  judgeState(&sensor);
+  // ===== 步骤4: 状态机判断 =====
+  determineTrackState(&sensor);
 
-  /* ---- 3. 输出计算（转向差速） ---- */
-  steering = computeOutput(&sensor);
+  // ===== 步骤5: 计算转向和目标速度 =====
+  calculateSteeringOutput(&sensor);
 
-  /* ---- 4. 差速模型：基础速度 ± 转向调整 ---- */
-  targetL = BASE_SPEED * speed_factor - steering;
-  targetR = BASE_SPEED * speed_factor + steering;
+  // ===== 目标速度低通滤波（平滑速度变化，防止突变）=====
+  leftCtrl.setpoint = leftCtrl.setpoint * 0.37 + prevLeftSetpoint * 0.63;
+  rightCtrl.setpoint = rightCtrl.setpoint * 0.37 + prevRightSetpoint * 0.63;
 
-  /* 目标速度限幅 */
-  if (targetL >  MAX_SPEED) targetL =  MAX_SPEED;
-  if (targetL < -MAX_SPEED) targetL = -MAX_SPEED;
-  if (targetR >  MAX_SPEED) targetR =  MAX_SPEED;
-  if (targetR < -MAX_SPEED) targetR = -MAX_SPEED;
+  // ===== 步骤6: 测量实际速度 =====
+  // 左轮速度计算：脉冲数 / 编码器线数 * 轮周长 * 频率
+  // 编码器：780线/圈，轮直径：2cm，轮周长 = 2πr = π*2 = 2π cm
+  float rawLeftVel = (leftPulse / 780.0) * 3.1415 * 2.0 * (1000 / CTRL_PERIOD);
+  leftPulse = 0;  // 清零脉冲计数
+  leftSpeed = leftSpeed * 0.6 + rawLeftVel * 0.4;  // 低通滤波
 
-  /* 速度平滑过渡（低通滤波，减少阶跃冲击） */
-  targetL = targetL * 0.6f + prevTarget1 * 0.4f;
-  targetR = targetR * 0.6f + prevTarget2 * 0.4f;
-  prevTarget1 = targetL;
-  prevTarget2 = targetR;
+  // 右轮速度计算（方向相反，所以加负号）
+  float rawRightVel = -(rightPulse / 780.0) * 3.1415 * 2.0 * (1000 / CTRL_PERIOD);
+  rightPulse = 0;  // 清零脉冲计数
+  rightSpeed = rightSpeed * 0.6 + rawRightVel * 0.4;  // 低通滤波
 
-  /* 写入PID目标值 */
-  pidL.targetVal = targetL;
-  pidR.targetVal = targetR;
+  // ===== 步骤7: 更新PID控制器 =====
+  updateVelocityPID(&leftCtrl, leftSpeed);
+  updateVelocityPID(&rightCtrl, rightSpeed);
 
-  /* ---- 5. 编码器→速度换算 ---- */
-  /* velocity = ( pulses / 780 pulses_per_rev ) * 2*pi*r * (1000ms / PERIODms )
-   *          = pulses * 6.283 / 780 * 100  （当 PERIOD=10 时）
-   * 780 = 编码器线数，2*pi*r = 轮周长（约 6.283 单位长度） */
-  velocity1 = (encoderVal1 / 780.0) * 3.1415 * 2.0 * (1000.0 / PERIOD);
-  velocity2 = (encoderVal2 / 780.0) * 3.1415 * 2.0 * (1000.0 / PERIOD);
+  // ===== 步骤8: 输出PWM控制信号 =====
+  driveMotor(&leftCtrl, DIR1, PWM1);
+  driveMotor(&rightCtrl, DIR2, PWM2);
 
-  /* 清零编码器脉冲累计（为下一周期做准备） */
-  encoderVal1 = 0;
-  encoderVal2 = 0;
-
-  /* ---- 6. 左右轮独立PID计算 ---- */
-  computePID(&pidL, velocity1);   // 左轮PID
-  computePID(&pidR, velocity2);   // 右轮PID（注意：右轮取反，因电机对向安装）
-
-  /* ---- 7. 电机输出 ---- */
-  static int lastPwm1 = 0, lastPwm2 = 0;
-  applyMotorOutput(&pidL, DIR1, PWM1, &lastPwm1);   // 左电机
-  /* 右轮电机：因对向安装，需取反后输出 */
-  pidR.output = -pidR.output;
-  applyMotorOutput(&pidR, DIR2, PWM2, &lastPwm2);   // 右电机
-  pidR.output = -pidR.output;   // 恢复原始值
-
-  t1 = targetL;
-  t2 = targetR;
+  // 保存当前目标速度用于下次滤波
+  prevLeftSetpoint = leftCtrl.setpoint;
+  prevRightSetpoint = rightCtrl.setpoint;
 }
 
-/* ==================== 初始化函数 ==================== */
+// ==================== 初始化和主循环 ====================
+
+/**
+ * Arduino初始化函数（上电后执行一次）
+ * 功能：配置所有硬件和软件参数
+ */
 void setup() {
-  /* 设置 Timer1 的 PWM 频率（提高至约 31kHz，减少电机啸叫）
-   * TCCR1B = TCCR1B & B11111000 | B00000001 → 不分频，约 31kHz PWM */
+  // 设置PWM频率为31250Hz（提高电机控制精度）
   TCCR1B = TCCR1B & B11111000 | B00000001;
 
-  /* 注册 MsTimer2 定时器回调（稍后在 setup 末尾启动） */
-  MsTimer2::set(PERIOD, control);
+  // 启动10ms定时器中断
+  MsTimer2::set(CTRL_PERIOD, updateControl);
+  MsTimer2::start();
 
-  /* 编码器引脚配置（上拉输入，增强抗干扰能力） */
-  pinMode(ENCODER_A1, INPUT_PULLUP);
-  pinMode(ENCODER_B1, INPUT_PULLUP);
-  pinMode(ENCODER_A2, INPUT_PULLUP);
-  pinMode(ENCODER_B2, INPUT_PULLUP);
+  // ===== 配置编码器引脚 =====
+  pinMode(ENCODER_A1, INPUT);
+  pinMode(ENCODER_B1, INPUT);
+  pinMode(ENCODER_A2, INPUT);
+  pinMode(ENCODER_B2, INPUT);
 
-  /* 编码器中断绑定（CHANGE 模式=2倍频） */
-  attachInterrupt(digitalPinToInterrupt(ENCODER_A1), getEncoder1, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_A2), getEncoder2, CHANGE);
+  // 绑定编码器中断（用于精确测速）
+  // 中断0 -> 数字引脚2（左轮编码器A相）
+  // 中断1 -> 数字引脚3（右轮编码器A相）
+  attachInterrupt(0, leftEncoderISR, CHANGE);
+  attachInterrupt(1, rightEncoderISR, CHANGE);
 
-  /* 串口初始化（调试输出） */
+  // 初始化串口（用于调试输出）
   Serial.begin(9600);
 
-  /* 左轮PID参数初始化 */
-  pidL.Kp = L_Kp;  pidL.Ki = L_Ki;  pidL.Kd = L_Kd;
-  pidL.integralMax = L_INTEGRAL_MAX;
-  pidL.targetVal = 0;  pidL.currentError = 0;  pidL.preError = 0;
-  pidL.derivative = 0;  pidL.integral = 0;  pidL.output = 0;
-
-  /* 右轮PID参数初始化 */
-  pidR.Kp = R_Kp;  pidR.Ki = R_Ki;  pidR.Kd = R_Kd;
-  pidR.integralMax = R_INTEGRAL_MAX;
-  pidR.targetVal = 0;  pidR.currentError = 0;  pidR.preError = 0;
-  pidR.derivative = 0;  pidR.integral = 0;  pidR.output = 0;
-
-  /* 电机PWM引脚 */
+  // ===== 配置电机控制引脚 =====
   pinMode(PWM1, OUTPUT);
-  pinMode(PWM2, OUTPUT);
-
-  /* 电机方向引脚 */
   pinMode(DIR1, OUTPUT);
+  pinMode(PWM2, OUTPUT);
   pinMode(DIR2, OUTPUT);
-  digitalWrite(DIR1, HIGH);   // 左电机初始方向：正转
-  digitalWrite(DIR2, LOW);    // 右电机初始方向（对向安装取反）
 
-  /* 8路循迹传感器引脚 */
-  pinMode(L4_PIN, INPUT); pinMode(L3_PIN, INPUT);
-  pinMode(L2_PIN, INPUT); pinMode(L1_PIN, INPUT);
-  pinMode(R1_PIN, INPUT); pinMode(R2_PIN, INPUT);
-  pinMode(R3_PIN, INPUT); pinMode(R4_PIN, INPUT);
+  // ===== 配置传感器引脚 =====
+  pinMode(L4_PIN, INPUT);
+  pinMode(L3_PIN, INPUT);
+  pinMode(L2_PIN, INPUT);
+  pinMode(L1_PIN, INPUT);
+  pinMode(R1_PIN, INPUT);
+  pinMode(R2_PIN, INPUT);
+  pinMode(R3_PIN, INPUT);
+  pinMode(R4_PIN, INPUT);
 
-  /* 所有初始化完成，启动定时中断 */
-  MsTimer2::start();
+  // ===== 初始化左轮PID控制器 =====
+  float dt = CTRL_PERIOD;  // 采样周期（ms）
+  // 增量式PID系数计算公式：
+  // coeff[0] = Kp * (1 + Ts/Ti + Td/Ts)  -- 当前误差系数
+  // coeff[1] = -Kp * (1 + 2*Td/Ts)       -- 上次误差系数
+  // coeff[2] = Kp * Td/Ts                 -- 上上次误差系数
+  leftCtrl.coeff[0] = P_GAIN * (1 + dt / I_TIME + D_TIME / dt);
+  leftCtrl.coeff[1] = -P_GAIN * (1 + 2 * D_TIME / dt);
+  leftCtrl.coeff[2] = P_GAIN * D_TIME / dt;
+  leftCtrl.setpoint = 0;
+  leftCtrl.err[0] = 0;
+  leftCtrl.err[1] = 0;
+  leftCtrl.err[2] = 0;
+  leftCtrl.control = 0;
+
+  // ===== 初始化右轮PID控制器 =====
+  rightCtrl.coeff[0] = P_GAIN * (1 + dt / I_TIME + D_TIME / dt);
+  rightCtrl.coeff[1] = -P_GAIN * (1 + 2 * D_TIME / dt);
+  rightCtrl.coeff[2] = P_GAIN * D_TIME / dt;
+  rightCtrl.setpoint = 0;
+  rightCtrl.err[0] = 0;
+  rightCtrl.err[1] = 0;
+  rightCtrl.err[2] = 0;
+  rightCtrl.control = 0;
 }
-
-/* ==================== 主循环 ==================== */
-void loop() {
-  /* 定期通过串口输出调试信息：
-   * 格式：当前状态  左轮速度  右轮速度 */
-  Serial.print("State: ");
-  Serial.print(current_state);
-  Serial.print("\tV_L: ");
-  Serial.print(velocity1);
-  Serial.print("\tV_R: ");
-  Serial.println(velocity2);
-  delay(100);   // 100ms 输出一次，避免刷屏
-}
-
-/* ==================== 编码器中断服务函数 ==================== */
 
 /**
- * @brief  编码器1（左轮）中断服务函数
- * @note   CHANGE 模式4倍频：A/B相边沿均触发
- *         根据A/B相电平关系判断旋转方向
+ * Arduino主循环函数（无限循环执行）
+ * 说明：实际控制逻辑在10ms定时中断中执行（updateControl函数）
+ *       这里只是保持程序运行，可以添加调试代码
  */
-void getEncoder1(void) {
+void loop() {
+  delay(100);  // 延时100ms，降低CPU占用
+
+  // 可以在这里添加调试输出，例如：
+  // Serial.print("Mode: "); Serial.println(currentMode);
+  // Serial.print("Sensors: ");
+  // for(int i=0; i<8; i++) Serial.print(sensorBuffer[i]);
+  // Serial.println();
+}
+
+// ==================== 编码器中断处理函数 ====================
+
+/**
+ * 左轮编码器中断服务函数
+ * 功能：根据A相和B相的状态判断旋转方向，更新脉冲计数
+ * 原理：正交编码器有A、B两相信号，相位差90度
+ *       通过判断A相变化时B相的状态，可以确定旋转方向
+ */
+void leftEncoderISR() {
   if (digitalRead(ENCODER_A1) == LOW) {
-    if (digitalRead(ENCODER_B1) == LOW) {
-      encoderVal1--;
-    } else {
-      encoderVal1++;
-    }
+    // A相为低电平时
+    if (digitalRead(ENCODER_B1) == LOW) leftPulse--;  // B也为低 -> 反转
+    else leftPulse++;  // B为高 -> 正转
   } else {
-    if (digitalRead(ENCODER_B1) == LOW) {
-      encoderVal1++;
-    } else {
-      encoderVal1--;
-    }
+    // A相为高电平时
+    if (digitalRead(ENCODER_B1) == LOW) leftPulse++;  // B为低 -> 正转
+    else leftPulse--;  // B也为高 -> 反转
   }
 }
 
 /**
- * @brief  编码器2（右轮）中断服务函数
- * @note   与编码器1逻辑相同，独立计数，互不影响
+ * 右轮编码器中断服务函数
+ * 功能：与左轮相同，根据A、B相状态判断旋转方向
  */
-void getEncoder2(void) {
+void rightEncoderISR() {
   if (digitalRead(ENCODER_A2) == LOW) {
-    if (digitalRead(ENCODER_B2) == LOW) {
-      encoderVal2--;
-    } else {
-      encoderVal2++;
-    }
+    // A相为低电平时
+    if (digitalRead(ENCODER_B2) == LOW) rightPulse--;  // B也为低 -> 反转
+    else rightPulse++;  // B为高 -> 正转
   } else {
-    if (digitalRead(ENCODER_B2) == LOW) {
-      encoderVal2++;
-    } else {
-      encoderVal2--;
-    }
+    // A相为高电平时
+    if (digitalRead(ENCODER_B2) == LOW) rightPulse++;  // B为低 -> 正转
+    else rightPulse--;  // B也为高 -> 反转
   }
 }
