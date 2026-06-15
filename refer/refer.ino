@@ -1,4 +1,5 @@
 #include<MsTimer2.h>//定时器库的头文件
+#include<Servo.h>//舵机库的头文件
 
 //----------------------------------定义管脚----------------------------------
 #define ENCODER_A1 2  //电机 1 (左)
@@ -21,6 +22,11 @@
 #define L6 A1
 #define L7 A0
 
+// 舵机引脚
+#define Servo_PIN1 8
+#define Servo_PIN2 9
+#define Servo_PIN3 10
+
 //----------------------------------定义常值----------------------------------
 #define PERIOD 10
 
@@ -37,6 +43,11 @@
 #define MAX_V 5.0   // 基础速度上限 (当一侧电机超速时，保证差速整体回缩)
 
 //----------------------------------全局变量----------------------------------
+// 舵机定义
+Servo myservo1; // 创建舵机对象
+Servo myservo2; // 舵机 1控制机械臂转动，舵机 2控制夹爪转动，舵机 3控制夹爪张开
+Servo myservo3;
+
 float target1 = 2.0, t1;    //左 目标速度
 float target2 = 2.0, t2;    //右 目标速度
 volatile long encoderVal1;  //编码器1值
@@ -76,6 +87,9 @@ float previous_error = 0;   // 记录上一次的偏差 (用于求微分)
 
 bool stopped = false;        // 全黑线停车标志
 
+volatile bool started = false;        // 启动序列完成标志（先复位舵机、再夹取、再出发）
+volatile bool servo_reset_pending = false;  // 全黑线停车后触发的舵机复位请求
+
 // 【新增】用于在主循环中打印调试的全局变量
 int sensorState[8] = {0};   // 存储 8 个光电管的实时状态
 float current_error_out = 0;// 存储实时计算出的加权偏差值
@@ -83,6 +97,12 @@ float current_error_out = 0;// 存储实时计算出的加权偏差值
 //----------------------------------测速与转向控制逻辑----------------------------------
 void control(void)
 {
+  // 启动前保持电机静止
+  if (!started) {
+    target1 = target2 = t1 = t2 = 0;
+    return;
+  }
+
   // 1. 读取 8 个传感器的状态
   sensorState[0] = (digitalRead(L0) == LOW) ? 1 : 0;
   sensorState[1] = (digitalRead(L1) == LOW) ? 1 : 0;
@@ -224,6 +244,7 @@ void control(void)
   // 道路交叉 / 全黑线停车
   if(LEDCounter == 8) {
     stopped = true;           // 触发停车标志
+    servo_reset_pending = true; // 触发舵机复位
     target1 = 0;
     target2 = 0;
     t1 = 0;
@@ -431,9 +452,30 @@ void setup() {
   pinMode(L5, INPUT);
   pinMode(L6, INPUT);
   pinMode(L7, INPUT);
+
+  // 初始化舵机引脚
+  myservo1.attach(Servo_PIN1);
+  myservo2.attach(Servo_PIN2);
+  myservo3.attach(Servo_PIN3);
 }
 
 void loop() {
+  // 启动序列：先复位舵机 → 再夹取 → 等待1秒 → 出发
+  if (!started) {
+    servo_Reset();
+    servo_Control();
+    delay(1000);
+    started = true;
+    return;
+  }
+
+  // 全黑线停车后触发舵机复位
+  if (servo_reset_pending) {
+    servo_Reset();
+    servo_reset_pending = false;
+    delay(100);
+  }
+
   // 1. 打印光电管数组状态 (例如: Sensors: 0 0 0 1 1 0 0 0 )
   // Serial.print("Sensors: ");
   // for (int i = 0; i < 8; i++) {
@@ -520,4 +562,24 @@ int pidController2(float targetVelocity, float currentVelocity)
   ek22 = ek21;
   ek21 = ek20;
   return (int)u2;
+}
+
+// 控制舵机转动和夹取
+void servo_Control(void)
+{
+    // servo.write(angle)可以直接写入舵机转动角度，若是 180°舵机，则 angle取值在 0 - 180之间
+    // 装配舵机时，若舵机的当前角度不确定，180°舵机可能无法转动到期望的位置。为避免这个问题，可以先使舵机转动到特定角度，比如 0°或 90°再进行装配。 
+    myservo3.write(100); // 张开夹爪
+    delay(1000);
+    myservo3.write(170); // 收紧夹爪
+}
+
+// 使舵机回到初始位置
+void servo_Reset(void)
+{
+    myservo1.write(120);
+    delay(500); // 等待舵机转动到位
+    myservo2.write(120);
+    delay(500); // 等待舵机转动到位
+    myservo3.write(100);
 }
