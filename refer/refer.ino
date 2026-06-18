@@ -24,8 +24,8 @@
 
 // 舵机引脚
 #define Servo_PIN1 8
-#define Servo_PIN2 9
-#define Servo_PIN3 10
+// #define Servo_PIN2 9
+// #define Servo_PIN3 10
 
 //----------------------------------定义常值----------------------------------
 #define PERIOD 10
@@ -36,17 +36,17 @@
 #define Td 15.0  // 原30，减半以抑制10ms下的微分放大噪声
 
 // 转向环 PD 参数 (权重模式专属，需要根据实际情况微调)
-#define Kp_steer 0.30  // 转向比例系数：决定转弯的猛烈程度 (已调至原来的2倍)
-#define Kd_steer 0.20  // 转向微分系数：适配10ms控制周期，由于 dError 变小，原0.10放大至0.20
+#define Kp_steer 0.3  // 转向比例系数：决定转弯的猛烈程度 (已调至原来的2倍) 0.3
+#define Kd_steer 0.40  // 转向微分系数：适配10ms控制周期，由于 dError 变小，原0.10放大至0.20
 
 #define V 3.0       // 基础速度
 #define MAX_V 5.0   // 基础速度上限 (当一侧电机超速时，保证差速整体回缩)
 
 //----------------------------------全局变量----------------------------------
 // 舵机定义
-Servo myservo1; // 创建舵机对象
-Servo myservo2; // 舵机 1控制机械臂转动，舵机 2控制夹爪转动，舵机 3控制夹爪张开
-Servo myservo3;
+Servo myservo1; // 舵机1控制机械臂转动
+// Servo myservo2; // 舵机2控制夹爪转动
+// Servo myservo3; // 舵机3控制夹爪张开
 
 float target1 = 2.0, t1;    //左 目标速度
 float target2 = 2.0, t2;    //右 目标速度
@@ -328,7 +328,7 @@ void control(void)
       speed_ratio = 0.8;
       break;
     case RECOVERING:
-      result = base_error * 0.8;
+      result = base_error * 1.5;  //0.8
       speed_ratio = 0.8; // 恢复期保持相对稳定的基础速度
       break;
   }
@@ -455,15 +455,15 @@ void setup() {
 
   // 初始化舵机引脚
   myservo1.attach(Servo_PIN1);
-  myservo2.attach(Servo_PIN2);
-  myservo3.attach(Servo_PIN3);
+  // myservo2.attach(Servo_PIN2);
+  // myservo3.attach(Servo_PIN3);
 }
 
 void loop() {
   // 启动序列：先复位舵机 → 再夹取 → 等待1秒 → 出发
   if (!started) {
     servo_Reset();
-    servo_Control();
+    // servo_Control();
     delay(1000);
     started = true;
     return;
@@ -564,22 +564,22 @@ int pidController2(float targetVelocity, float currentVelocity)
   return (int)u2;
 }
 
-// 控制舵机转动和夹取
-void servo_Control(void)
-{
-    // servo.write(angle)可以直接写入舵机转动角度，若是 180°舵机，则 angle取值在 0 - 180之间
-    // 装配舵机时，若舵机的当前角度不确定，180°舵机可能无法转动到期望的位置。为避免这个问题，可以先使舵机转动到特定角度，比如 0°或 90°再进行装配。 
-    myservo3.write(100); // 张开夹爪
-    delay(1000);
-    myservo3.write(170); // 收紧夹爪
-}
+// // 控制舵机转动和夹取
+// void servo_Control(void)
+// {
+//     // servo.write(angle)可以直接写入舵机转动角度，若是 180°舵机，则 angle取值在 0 - 180之间
+//     // 装配舵机时，若舵机的当前角度不确定，180°舵机可能无法转动到期望的位置。为避免这个问题，可以先使舵机转动到特定角度，比如 0°或 90°再进行装配。
+//     myservo3.write(100); // 张开夹爪
+//     delay(1000);
+//     myservo3.write(170); // 收紧夹爪
+// }
 
 // 使舵机回到初始位置
 void servo_Reset(void)
 {
     myservo1.write(120);
     delay(500); // 等待舵机转动到位
-    myservo2.write(120);
-    delay(500); // 等待舵机转动到位
-    myservo3.write(100);
+    // myservo2.write(120);
+    // delay(500); // 等待舵机转动到位
+    // myservo3.write(100);
 }
