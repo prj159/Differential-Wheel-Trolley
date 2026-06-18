@@ -24,8 +24,8 @@
 
 // 舵机引脚
 #define Servo_PIN1 8
-// #define Servo_PIN2 9
-// #define Servo_PIN3 10
+#define Servo_PIN2 9
+#define Servo_PIN3 10
 
 //----------------------------------定义常值----------------------------------
 #define PERIOD 10
@@ -45,8 +45,8 @@
 //----------------------------------全局变量----------------------------------
 // 舵机定义
 Servo myservo1; // 舵机1控制机械臂转动
-// Servo myservo2; // 舵机2控制夹爪转动
-// Servo myservo3; // 舵机3控制夹爪张开
+Servo myservo2; // 舵机2控制夹爪转动
+Servo myservo3; // 舵机3控制夹爪张开
 
 float target1 = 2.0, t1;    //左 目标速度
 float target2 = 2.0, t2;    //右 目标速度
@@ -190,6 +190,13 @@ void control(void)
   } else {
     centroid = last_valid_centroid; // 丢线降噪期间，冻结质心为上一有效位置
   }
+
+  // 2.25 质心跳变限幅：防止传感器干扰导致方向误判
+  static float prev_centroid = 3.5;
+  float delta = centroid - prev_centroid;
+  if (delta > 2.5)      centroid = prev_centroid + 2.5;
+  else if (delta < -2.5) centroid = prev_centroid - 2.5;
+  prev_centroid = centroid;
 
   // 2.5 丢线恢复侧过滤 (防误识别邻道线)
   // 当处于丢线状态且刚重新看到线时，判断线出现的位置是否合理。
@@ -455,15 +462,15 @@ void setup() {
 
   // 初始化舵机引脚
   myservo1.attach(Servo_PIN1);
-  // myservo2.attach(Servo_PIN2);
-  // myservo3.attach(Servo_PIN3);
+  myservo2.attach(Servo_PIN2);
+  myservo3.attach(Servo_PIN3);
 }
 
 void loop() {
   // 启动序列：先复位舵机 → 再夹取 → 等待1秒 → 出发
   if (!started) {
     servo_Reset();
-    // servo_Control();
+    servo_Control();
     delay(1000);
     started = true;
     return;
@@ -564,22 +571,20 @@ int pidController2(float targetVelocity, float currentVelocity)
   return (int)u2;
 }
 
-// // 控制舵机转动和夹取
-// void servo_Control(void)
-// {
-//     // servo.write(angle)可以直接写入舵机转动角度，若是 180°舵机，则 angle取值在 0 - 180之间
-//     // 装配舵机时，若舵机的当前角度不确定，180°舵机可能无法转动到期望的位置。为避免这个问题，可以先使舵机转动到特定角度，比如 0°或 90°再进行装配。
-//     myservo3.write(100); // 张开夹爪
-//     delay(1000);
-//     myservo3.write(170); // 收紧夹爪
-// }
+// 控制舵机转动和夹取
+void servo_Control(void)
+{
+    myservo3.write(100); // 张开夹爪
+    delay(1000);
+    myservo3.write(170); // 收紧夹爪
+}
 
 // 使舵机回到初始位置
 void servo_Reset(void)
 {
     myservo1.write(120);
     delay(500); // 等待舵机转动到位
-    // myservo2.write(120);
-    // delay(500); // 等待舵机转动到位
-    // myservo3.write(100);
+    myservo2.write(120);
+    delay(500); // 等待舵机转动到位
+    myservo3.write(100);
 }
